@@ -1,8 +1,7 @@
 /**************************************************************************************************
-30 5A 26 01 58 01 01 00 /7A
+30 5A 26 01 58 01 01 00
 20 00 00 00 26 05 00 00 00 58 15 26 20 58 20 07
-30 5A 61 95 27 31 00 7A
-53 53 01 01 00 00 00 01 01 09
+
   Filename:       simpleBLEPeripheral.c
   Revised:        $Date: 2015-07-13 11:43:11 -0700 (Mon, 13 Jul 2015) $
   Revision:       $Revision: 44336 $
@@ -73,7 +72,7 @@
 
 #include "osal_snv.h"
 #include "ICallBleAPIMSG.h"
-#include "math.h"
+
 #include "util.h"
 #include "board_lcd.h"
 #include "board_key.h"
@@ -88,22 +87,23 @@
 #include "scif.h"
 
 //PWM
+#include <ti/drivers/PIN.h>
+#include <ti/drivers/PWM2.h>
 #include <ti/sysbios/BIOS.h>
 #include <ti/sysbios/knl/Clock.h>
 #include <ti/sysbios/knl/Task.h>
 #include <xdc/runtime/Log.h>
-#include <ti/drivers/PIN.h>
-#include <ti/drivers/PWM2.h>
 
 //時間
 #include <time.h>
 #include <ti/sysbios/hal/Seconds.h>
-#include <UTC_Clock.h>
-#include <GUA_RTC.h>
+
+//watch dog
+#include <ti/drivers/Watchdog.h> 
+
 /*********************************************************************
  * CONSTANTS
-*/
-
+ */
 //PWM
 #define PERIOD_US 1000 
 
@@ -121,7 +121,7 @@
 
 // Maximum connection interval (units of 1.25ms, 800=1000ms) if automatic
 // parameter update request is enabled
-#define DEFAULT_DESIRED_MAX_CONN_INTERVAL     800
+#define DEFAULT_DESIRED_MAX_CONN_INTERVAL     80
 #else
 // Minimum connection interval (units of 1.25ms, 8=10ms) if automatic
 // parameter update request is enabled
@@ -137,18 +137,17 @@
 
 // Supervision timeout value (units of 10ms, 1000=10s) if automatic parameter
 // update request is enabled
-#define DEFAULT_DESIRED_CONN_TIMEOUT          20
+#define DEFAULT_DESIRED_CONN_TIMEOUT          1000
 
 // Whether to enable automatic parameter update request when a connection is
 // formed
-#define DEFAULT_ENABLE_UPDATE_REQUEST         FALSE
+#define DEFAULT_ENABLE_UPDATE_REQUEST         TRUE
 
 // Connection Pause Peripheral time value (in seconds)
 #define DEFAULT_CONN_PAUSE_PERIPHERAL         6
 
 // How often to perform periodic event (in msec)
-#define SBP_PERIODIC_EVT_PERIOD               100
-#define NOTI_PERIOD                                          5000
+#define SBP_PERIODIC_EVT_PERIOD               1000
 
 #ifdef FEATURE_OAD
 // The size of an OAD packet.
@@ -163,15 +162,12 @@
 #define SBP_TASK_STACK_SIZE                   644
 #endif
 
-#define SNV_IDX_DEVICENAME 0x82
-
 // Internal Events for RTOS application
-#define SBP_STATE_CHANGE_EVT                0x0001
-#define SBP_CHAR_CHANGE_EVT                 0x0002
-#define SBP_CONN_EVT_END_EVT                0x0004
-#define SBP_PERIODIC_EVT                           0x0008
-#define SBP_NOTIFY                                       0x0010
-#define CLEAR_EVT                                        0x0020
+#define SBP_STATE_CHANGE_EVT                  0x0001
+#define SBP_CHAR_CHANGE_EVT                   0x0002
+#define SBP_PERIODIC_EVT                      0x0004
+#define SBP_CONN_EVT_END_EVT                  0x0008
+#define CLEAR_EVT                             0x0010
 /*********************************************************************
  * TYPEDEFS
  */
@@ -190,69 +186,58 @@ typedef struct
 /*********************************************************************
  * LOCAL VARIABLES
  */
-// GAP GATT Attributes  設備名字
-char attDeviceName[GAP_DEVICE_NAME_LEN] = "Wistron_B_Node";//預設的device name
 
-//notify
-uint16 gapConnHandle;
 
 //PWM
 PWM_Handle hPWM;
+char        PWM_taskStack[512];
+Task_Struct PWM_taskStruct;
 
-//時間
-int systimelink_now[4];
-int systimelink_over[4];
-uint16 mins;
-int systime[4];
-int time_link_now,time_link_over,timeAll,time_now;
-UTCTimeStruct GUA_Timer;
-uint8 bBuf[20] = {0};     
-uint8 *p = bBuf;
-uint8 sysovertime[3];
-bool sys_F=0;//同步旗標  0=未開始
-
-bool itself=0;//uart 自己否
+bool ledvale;
 
 int tx=0;
 //UART
 uint8 rxbuf[100]={0};
+char txbuf7688[63]={0};
+char   *ptr =  txbuf7688;
+
 bool dontsave=0;
-bool dontsave_1=0;
 bool repeat_flag=0;
 bool self_falg=0;
-bool linked = 0;
 //廣播buffer
 
 typedef struct 
 {
-  uint8 devicecount;            //廣播秒數
+  int devicecount;            //廣播秒數
+  bool over_flag;               //是否已被廣播
   bool data_flag;               //是否有資料
   bool CT_flag;                // 控燈 1 = 自己
-  char data[31];             //data   
-  bool self;
+  uint8_t data[31];             //data   
+  bool Peripheral;             
+  bool uart7688;                //是否已傳過7688
 }devicedata; 
 
-char txbuf[31]={0};
-bool anss;
-char tsss[31];
+uint8 txbuf[31]={0};
+
 static devicedata device[36];
 
 static uint8 newValue3[20];       //收到廣播之位置
-int  flash[20]={0};//自深地址+終點
-
-
-//三角定位
-int Pr0;
-int  E0_1;
-int  E0_2;
+int flash[20]={0};//自深地址+終點
 
 //控燈
 uint8 hoppinglight[40]; 
 int controltime=0;
 
+//write lat & lon to 7688
+bool lat_lon7688=1;
+int get7688buf[10];
+char tx7688buffer[31];
+char final_7688[50];
+//時間
+uint8 App_time[3]={0};
+
 
 uint8 uartover[31]={0};
-bool OAD_FLAG = 0;
 
 ///////////////經緯度
 uint8_t MyLight_latSum_1,MyLight_latSum_2,MyLight_latSum_3,MyLight_latSum_4,MyLight_latSum_5;
@@ -264,28 +249,22 @@ int MyLight_lonSum;
 double longitude;      //經度
 double latitude;        //緯度
 uint8 MyLight_latSum_printf_lat_H_1,MyLight_latSum_printf_lat_H_2,MyLight_latSum_printf_lat_H;
-uint8 MyLight_latSum_printf_lat_L_1,MyLight_latSum_printf_lat_L_2,MyLight_latSum_printf_lat_L,MyLight_lonSum_printf_lon_H,MyLight_lonSum_printf_lon_L;
-bool starting_point=0; //寫經緯度旗標
-bool end=0;//寫終點旗標
-
-char DeviceName[10]={0};
-
+uint8 MyLight_latSum_printf_lat_L_1,MyLight_latSum_printf_lat_L_2,MyLight_latSum_printf_lat_L,MyLight_latSum_printf_lon_H,MyLight_latSum_printf_lon_L;
 uint8_t  addrbuf[31]={0};//經緯
 uint8_t  addrbufack[31]={0};//回傳經緯
  
-//MAC
-uint8_t nGUA_Address[6];
-char MAC_Address[8];
-
+ //MAC
+ uint8_t nGUA_Address[6];
+ uint8_t MAC_Address[8];
 
 
 int jzx=0;//讀取筆數
 int once=0;//有沒有收到rxbuf
 int order=0;//廣播順序
-bool scanp = 1;//切換廣播data
+
 //UART
-
-
+uint8 uart_rxbuf[]={0};
+uint8 temp[30]={0};
 
 // Entity ID globally used to check for source and/or destination of messages
 static ICall_EntityID selfEntity;
@@ -296,8 +275,7 @@ static ICall_Semaphore sem;
 // Clock instances for internal periodic events.
 static Clock_Struct periodicClock;
 static Clock_Struct SAVEClock;
-//static Clock_Struct CLEARClock;
-//static Clock_Struct NOTI;
+static Clock_Struct CLEARClock;
 
 // Queue object used for app messages
 static Queue_Struct appMsg;
@@ -314,54 +292,10 @@ static uint16_t events;
 
 static PIN_Handle hSbpPins;
 
-
-//PWM
-char        PWM_taskStack[512];
-Task_Struct PWM_taskStruct;
-
-uint16 handle  ;
-
-//delay
-static void delaysec(int sec_use);
-uint32_t sec;
-time_t t;
-
 // Task configuration
 Task_Struct sbpTask;
 Char sbpTaskStack[SBP_TASK_STACK_SIZE];
 
-//devicename
-uint8_t set_snv_devicename(void) //device name length is define as 21
-{
-  char attDeviceName_change[7] = "W_Node";//預設的device name
-  
-  osal_snv_read(0x81,sizeof(DeviceName),DeviceName);
-  
-  if(   DeviceName[7]!=    0xFF    ||      DeviceName[8]!=    0xFF    ||    DeviceName[9]!=    0xFF      )
-  {
-    GGS_SetParameter(GGS_DEVICE_NAME_ATT, GAP_DEVICE_NAME_LEN, DeviceName);
-    return (FALSE);
-  }
-  else
-  {
-    GGS_SetParameter(GGS_DEVICE_NAME_ATT, GAP_DEVICE_NAME_LEN, attDeviceName_change);
-    return (FALSE); 
-  }
-  
-
-  /*
-       if(osal_snv_read(SNV_IDX_DEVICENAME,sizeof(uint8_t)*GAP_DEVICE_NAME_LEN, attDeviceName) == ICALL_INVALID_ENTITY_ID)//it means the there isn't any device name on snv
-       {
-           //set thedevice name as default setting.
-           GGS_SetParameter(GGS_DEVICE_NAME_ATT, GAP_DEVICE_NAME_LEN, attDeviceName);
-           return (FALSE);
-       }
-       else
-       {
-           GGS_SetParameter(GGS_DEVICE_NAME_ATT, GAP_DEVICE_NAME_LEN, attDeviceName);
-           return (TRUE);
-       }*/
-}
 
 //SCS_Uart_banana///////////////////////////////////////////////////////////////
 Task_Struct my_UART_Task;
@@ -376,6 +310,8 @@ void scCtrlReadyCallback(void) {
 //UART inhere
 void scTaskAlertCallback(void) {
 
+    Util_stopClock(&SAVEClock);//停止
+    
     // Wake up the OS task
     Semaphore_post(Semaphore_handle(&semScTaskAlert));
     
@@ -389,245 +325,113 @@ void scTaskAlertCallback(void) {
     int rxFifoCount = scifUartGetRxFifoCount();
     
     //讀出這次buffer
-    for(int a=0;a<rxFifoCount;a++)
+       for(int a=0;a<rxFifoCount;a++)
      rxbuf[a] =(      (char) scifUartRxGetChar()      );
+    
 
+    
+    
+    
+
+    
+    /*
+    while (rxFifoCount--) 
+    {
+        scifUartTxPutChar(      (char) scifUartRxGetChar()      );//寫
+    }
+*/
+    
+    
+    
     
     // Clear the events that triggered this
     scifUartClearEvents();
 
     // Acknowledge the alert event
+    
     scifAckAlertEvents();    
     ////////////////////////////////////讀
     
-    if(rxbuf[0]=='$')
+    if(rxbuf[0] == 'O' && rxbuf[1] == 'K')
     {
-      //判斷data是否重複
-      for( int a=0; a<36; a++)
-      {
-        //手環判斷1~24bytes是否一樣  輸出1->一樣
-        if(
-            rxbuf[0] == device[a].data[0] &&
-            rxbuf[1] == device[a].data[1] &&
-            rxbuf[2] == device[a].data[2] &&
-            rxbuf[3] == device[a].data[3] &&              
-            rxbuf[4] == device[a].data[4] &&
-            rxbuf[5] == device[a].data[5] &&           
-            rxbuf[6] == device[a].data[6] &&            
-            rxbuf[7] == device[a].data[7] &&           
-            rxbuf[8] == device[a].data[8] &&            
-            rxbuf[9] == device[a].data[9] &&                 
-            rxbuf[10] == device[a].data[10] &&                  
-            rxbuf[11] == device[a].data[11] &&            
-            rxbuf[12] == device[a].data[12] &&              
-            rxbuf[13] == device[a].data[13] &&               
-            rxbuf[14] == device[a].data[14] &&                 
-            rxbuf[15] == device[a].data[15] &&              
-            rxbuf[16] == device[a].data[16] &&               
-            rxbuf[17] == device[a].data[17] &&                 
-            rxbuf[18] == device[a].data[18] &&              
-            rxbuf[19] == device[a].data[19] &&               
-            rxbuf[20] == device[a].data[20] &&                             
-            rxbuf[21] == device[a].data[21] &&                
-            rxbuf[22] == device[a].data[22] &&                 
-            rxbuf[23] == device[a].data[23] &&                 
-            rxbuf[24] == device[a].data[24] &&                 
-            rxbuf[25] == device[a].data[25] &&    
-            rxbuf[26] == device[a].data[26] &&                
-            rxbuf[27] == device[a].data[27] &&                 
-            rxbuf[28] == device[a].data[28] &&                  
-            rxbuf[29] == device[a].data[29] &&    
-            rxbuf[30] == device[a].data[30]   
-           )
-        {
-          repeat_flag = 1;//重複跳出
-          break;
-        }
-      }
-      
-      
-      if( repeat_flag == 0)
-      {
-          //廣播buffer 存取讀到的值
-          for(int z=0;z<31;z++)
-          {
-            device[jzx].data[z]=rxbuf[z];
-          }
-                       
-          device[jzx].data_flag=1;//有資料              
-          //填寫自己終點
-
-          jzx++;//新uart筆數增加
-          if(jzx>35)
-            jzx=0;
-      }
+      PIN_setOutputValue(hSbpPins, Board_in, 0);  
+      lat_lon7688=0;
     }
-    
-    repeat_flag = 0;
-    
-    
     //存新資料
     if(   (rxbuf[0]=='P')&&(rxbuf[30]==0x07)
           ||(rxbuf[0]=='T')&&(rxbuf[30]==0x07)
           ||(rxbuf[0]=='R')&&(rxbuf[30]==0x07)   
           ||(rxbuf[0]==0xE0)&&(rxbuf[30]==0x07)
-          ||(rxbuf[0]=='C')&&(rxbuf[1]=='T') )
+          ||(rxbuf[0]=='C')&&(rxbuf[1]=='T')&&(rxbuf[30]==0x07) 
+          ||(rxbuf[0]=='$')  
+            
+            )
       {
-        //檢查不一樣才存
-        for(int d=0;d<36;d++)
-        {
-        if( (rxbuf[07] == device[d].data[07])       &&
-             (rxbuf[10] == device[d].data[10])       && 
-             (rxbuf[11] == device[d].data[11])       &&                            
-             (rxbuf[12] == device[d].data[12])       &&                            
-             (rxbuf[13] == device[d].data[13])       )
-          {
-            //不存旗標
-            dontsave=1;
-            break;
-          }
-        }
-        
-        
-        if(dontsave==0)
-        {
-        //掃描判斷是否自己  亮滅燈+廣播
-          if( 
-              rxbuf[10] == MyLight_lonSum_printf_lon_H  &&
-              rxbuf[11] == MyLight_lonSum_printf_lon_L  &&
-              rxbuf[12] == MyLight_latSum_printf_lat_H  &&
-              rxbuf[13] == MyLight_latSum_printf_lat_L  
-             )//是自己
-          {
-            itself=1;
-            device[jzx].CT_flag=1;
-            
-            //廣播buffer 存取讀到的值
-            memcpy(device[jzx].data,rxbuf,31);
-                        
-            device[jzx].data_flag=1;//有資料              
-            device[jzx].CT_flag = 1;
-
-            jzx++;//新uart筆數增加   
-            
-            if(jzx>=35)
-              jzx=0;   
-            
-            if(rxbuf[23] == 0x01)//亮燈
-            {
-              PIN_setOutputValue(hSbpPins, Board_LED6, 1);   
-            }
-            else//滅燈
-            {
-              PIN_setOutputValue(hSbpPins, Board_LED6, 0);  
-            }
-        }
-      }
-      if(itself==0)//非自己
-      {
-        //檢查不一樣才存
-        for(int d=0;d<36;d++)
-        {
-          if(       (rxbuf[07] == device[d].data[07])       &&
-                     (rxbuf[10] == device[d].data[10])       && 
-                     (rxbuf[11] == device[d].data[11])       &&                            
-                     (rxbuf[12] == device[d].data[12])       &&                            
-                     (rxbuf[13] == device[d].data[13])       )
-          {
-            //不存旗標
-            dontsave=1;
-            break;
-          }
-        }
-        
-        if(dontsave==0)//save
-        {
-          //廣播buffer 存取讀到的值
-          memcpy(device[jzx].data,rxbuf,31);
-                   
-          device[jzx].data_flag=1;//有資料              
-          device[jzx].CT_flag = 1;
-          
-          jzx++;//新uart筆數增加
-          
-          if(jzx>=35)
-            jzx=0;
-          
-        }      
-      }
-     }
-    
-    ///////////////////////////////////收到刪除DATA
-    /*
-    if(rxbuf[0]==0xAC)
-    {
-      for(int u=0;u<36;u++)
+      //檢查不一樣才存
+      for(int d=0;d<36;d++)
       {
         if(
-           (device[u].data[1]    ==      rxbuf[1])  &&
-           (device[u].data[2]    ==      rxbuf[2])  &&
-           (device[u].data[3]    ==      rxbuf[3])  &&
-           (device[u].data[4]    ==      rxbuf[4])  &&
-           (device[u].data[5]    ==      rxbuf[5])  &&
-           (device[u].data[6]    ==      rxbuf[6])  &&  
-           (device[u].data[7]    ==      rxbuf[7])  &&  
-           (device[u].data[8]    ==      rxbuf[8])  &&  
-           (device[u].data[9]    ==      rxbuf[9])  &&  
-           (device[u].data[10]    ==      rxbuf[10])  &&  
-           (device[u].data[11]    ==      rxbuf[11])  &&  
-           (device[u].data[12]    ==      rxbuf[12])  &&  
-           (device[u].data[13]    ==      rxbuf[13])  &&  
-           (device[u].data[14]    ==      rxbuf[14])  &&  
-           (device[u].data[15]    ==      rxbuf[15])  &&  
-           (device[u].data[16]    ==      rxbuf[16])  &&
-           (device[u].data[17]    ==      rxbuf[17])  &&  
-           (device[u].data[18]    ==      rxbuf[18])  &&  
-           (device[u].data[19]    ==      rxbuf[19])  &&  
-           (device[u].data[20]    ==      rxbuf[20])  &&  
-           (device[u].data[21]    ==      rxbuf[21])  &&  
-           (device[u].data[22]    ==      rxbuf[22])  &&  
-           (device[u].data[23]    ==      rxbuf[23])  && 
-           (device[u].data[24]    ==      rxbuf[24])  &&  
-           (device[u].data[25]    ==      rxbuf[25])  &&  
-           (device[u].data[26]    ==      rxbuf[26])  &&  
-           (device[u].data[27]    ==      rxbuf[27])  && 
-           (device[u].data[28]    ==      rxbuf[28])  && 
-           (device[u].data[29]    ==      rxbuf[29])  //&&  
-           //(device[u].data[30]    ==      rxbuf[30])    06.27
+             (rxbuf[2] == device[d].data[2])       &&
+             (rxbuf[3] == device[d].data[3])       &&
+             (rxbuf[4] == device[d].data[4])       &&
+             (rxbuf[5] == device[d].data[5])       &&
+             (rxbuf[6] == device[d].data[6])       &&
+             (rxbuf[7] == device[d].data[7])       &&
+             (rxbuf[8] == device[d].data[8])       && 
+             (rxbuf[9] == device[d].data[9])        
            )
         {
-            device[u].data_flag=0;//清空buffer
-            device[u].devicecount=0;
-            
-            for(int s=0;s<31;s++)
-              device[u].data[s]=0; 
-            
-            order++;
-
+          //不存旗標 重複 把廣播旗標歸位
+          device[d].Peripheral=1;
+          dontsave=1;
+          break;
         }
       }
- 
-
-      dontsave = 0;
-      if(order >= 35)
-        order = 0;
       
-      if(jzx >= 35)
-        jzx = 0;
+      if(dontsave==0)
+      {
+        //掃描判斷是否自己  亮滅燈
+        if( rxbuf[22] == 0x01 )//是自己
+        {
+          device[jzx].CT_flag=1;
+          if(rxbuf[23] == 0x01)//亮燈
+          {
+            PIN_setOutputValue(hSbpPins, Board_LED6, 1);   
+          }
+          else//滅燈
+          {
+            PIN_setOutputValue(hSbpPins, Board_LED6, 0);  
+          }
+        }
 
-      PIN_setOutputValue(hSbpPins, Board_LED0, 0);
-    }
-    */
-    if(rxbuf[0] == 'W'  &&  rxbuf[1] == 'W')  //對應slave 892
-    {
-      scifUartTxPutChars(MAC_Address,8);
-    }
+        //廣播buffer 存取讀到的值
+        for(int z=0;z<31;z++)
+        {
+          device[jzx].data[z]=rxbuf[z];
+        }
+        device[jzx].Peripheral=1;
+        device[jzx].over_flag=0;//未廣播              
+        device[jzx].data_flag=1;//有資料              
+        //填寫自己終點
+        
+        device[jzx].data[25]=MyLight_latSum_printf_lon_H;//1
+        device[jzx].data[26]=MyLight_latSum_printf_lon_L;//2
+        device[jzx].data[27]=MyLight_latSum_printf_lat_H;//1
+        device[jzx].data[28]=MyLight_latSum_printf_lat_L;//2
+        jzx++;//新uart筆數增加
+        
+        if(jzx>=35)
+          jzx = 0;
+        
+      }
+     }
+    for(int x=0; x<100;x++)
+      rxbuf[x]=0;
     
-    
-    
-    dontsave_1=0;
     dontsave=0;
 
+    
+    Util_startClock(&SAVEClock);//重新啟動本事件
 } // scTaskAlertCallback
 //SCS_Uart_banana///////////////////////////////////////////////////////////////
     
@@ -636,32 +440,31 @@ void scTaskAlertCallback(void) {
 //static gaprole_States_t gapProfileState = GAPROLE_INIT;
 
 // GAP - SCAN RSP data (max size = 31 bytes)
-
+/*
 static uint8_t scanRspData[] =
 {
   // complete name
-  0x0B,   // length of this data
+  0x14,   // length of this data
   GAP_ADTYPE_LOCAL_NAME_COMPLETE,
-  0x53,   // 
-  0x69,   // 
-  0x6d,   // 
-  0x70,   // 
-  0x6c,   // 
-  0x65,   // 
-  0x42,   // 
-  0x4c,   // 
-  0x45,   // 
-  0x50,   // 
-  
-  0x07,
-  GAP_ADTYPE_MANUFACTURER_SPECIFIC,
+  0x53,   // 'S'
+  0x69,   // 'i'
+  0x6d,   // 'm'
+  0x70,   // 'p'
+  0x6c,   // 'l'
+  0x65,   // 'e'
+  0x42,   // 'B'
+  0x4c,   // 'L'
+  0x45,   // 'E'
+  0x50,   // 'P'
   0x65,   // 'e'
   0x72,   // 'r'
   0x69,   // 'i'
   0x70,   // 'p'
   0x68,   // 'h'
   0x65,   // 'e'
-
+  0x72,   // 'r'
+  0x61,   // 'a'
+  0x6c,   // 'l'
 
   // connection interval range
   0x05,   // length of this data
@@ -676,57 +479,15 @@ static uint8_t scanRspData[] =
   GAP_ADTYPE_POWER_LEVEL,
   0       // 0dBm
 };
+*/
+static uint8_t  ios_data[31]={0x00,0xCC,0x4c,0x00,0x02,0x15,0x13,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x01,0xc5};
+static uint8_t  hand_data[14]={0x00};
 
-static uint8 advertData_IOS[] = 
-{ 
-   // 25 byte ibeacon advertising data
-  // Preamble: 0x4c000215
-  // UUID: E2C56DB5-DFFB-48D2-B060-D0F5A71096E0
-  // Major: 1 (0x0001)
-  // Minor: 1 (0x0001)
-  // Measured Power: -59 (0xc5)
-  0x1A, // length of this data including the data type byte
-  GAP_ADTYPE_MANUFACTURER_SPECIFIC, // manufacturer specific advertisement data type
 
-  0x4c,
-  0x00,
-  0x02,
-  0x15,
-  
-  
-  0xe2,// 6 start  (0開始算) 
-  0xc5,
-  0x6d,
-  0xb5,
-  0xdf,
-  0xfb,
-  0x00,
-  0x00,
-  0x00,                                                                  
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  
-  
-  0x00,//22 start
-  0x9,
-  0x8,
-  0x9,
-  
-  0xc5
-};
-static uint8_t  ios_data[31]={0xBB,0xBB,0xBB,0xBB,0xBB,0xBB,0x00,0x02,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xAB,0xAB,0xAB,0x24,0x25,0x26,0x27,0x28,0x29,0x30};
-
-//static uint8_t  hand_data[14]={'V','C',0x25,0x04,0x26,0x05,0x01,0x21,0x53,0x58,0x15,0x00,0x07,0x00};
 
 // GAP - Advertisement data (max size = 31 bytes, though this is
 // best kept short to conserve power while advertisting)
-
-static uint8_t advertData[] =//手機連線要一樣 要放在adver裡面
+static uint8_t advertData[] =
 {
   // Flags; this sets the device to use limited discoverable
   // mode (advertises for 30 seconds at a time) instead of general
@@ -748,7 +509,8 @@ static uint8_t advertData[] =//手機連線要一樣 要放在adver裡面
 #endif //!FEATURE_OAD
 };
 
-
+// GAP GATT Attributes
+static uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "Router01";
 
 // Globals used for ATT Response retransmission
 static gattMsgEvent_t *pAttRsp = NULL;
@@ -757,16 +519,22 @@ static uint8_t rspTxRetry = 0;
 /*********************************************************************
  * LOCAL FUNCTIONS
  */
+
+//devicename
+//device name
+uint8_t set_snv_devicename(void);
+
+//delay
+static void delaysec(int sec_use);
+uint32_t sec;
+time_t t;
+
+
 //UART_M0
 static void Uart_taskFxn (UArg a0, UArg a1);
+
 //PWM
 static void PWM_taskFxn (UArg a0, UArg a1);
-//時間
-static void systimeAns(int getTicks);
-//check
-bool check_buffer( char *inputbuffer);
-//設備名稱
-uint8_t set_snv_devicename(void);
 
 static void SimpleBLEPeripheral_init( void );
 static void SimpleBLEPeripheral_taskFxn(UArg a0, UArg a1);
@@ -774,12 +542,16 @@ static void SimpleBLEPeripheral_taskFxn(UArg a0, UArg a1);
 static void GUA_Read_Mac(uint8 *pGUA_Address);  
 char *GUA_Addr2Str(uint8 *pGUA_Addr);  
 //MAC
+
+//watchdog
+void wdtInitFxn() ;
+char* insert(char s[], char t[], int i);
 static uint8_t SimpleBLEPeripheral_processStackMsg(ICall_Hdr *pMsg);
 static uint8_t SimpleBLEPeripheral_processGATTMsg(gattMsgEvent_t *pMsg);
 static void SimpleBLEPeripheral_processAppMsg(sbpEvt_t *pMsg);
 static void SimpleBLEPeripheral_processStateChangeEvt(gaprole_States_t newState);
 static void SimpleBLEPeripheral_processCharValueChangeEvt(uint8_t paramID);
-static void SimpleBLEPeripheral_performPeriodicTask(void);
+//static void SimpleBLEPeripheral_performPeriodicTask(void);
 
 static void SimpleBLEPeripheral_sendAttRsp(void);
 static void SimpleBLEPeripheral_freeAttRsp(uint8_t status);
@@ -832,6 +604,7 @@ static oadTargetCBs_t simpleBLEPeripheral_oadCBs =
 /*********************************************************************
  * PUBLIC FUNCTIONS
  */
+
 /*********************************************************************
  * @fn      PWM_Task_banana
  *
@@ -852,8 +625,6 @@ void PWM_Task(void)
   Task_construct(&PWM_taskStruct, PWM_taskFxn, &params, NULL);
 }
 /*********************************************************************
-
-********************************************************************
  * @fn      UART_creatTask_banana
  *
  * @brief   Task creation function for the SES_UART
@@ -871,11 +642,11 @@ void UART_creatTask(void)
   taskParams.stackSize = sizeof(my_UART_TaskStack);
   taskParams.priority = 3;
   Task_construct(&my_UART_Task, Uart_taskFxn, &taskParams, NULL);
-
-  Semaphore_Params semParams;
-  Semaphore_Params_init(&semParams);
-  semParams.mode = Semaphore_Mode_BINARY;
-  Semaphore_construct(&semScTaskAlert, 0, &semParams);
+  
+   Semaphore_Params semParams;
+   Semaphore_Params_init(&semParams);
+   semParams.mode = Semaphore_Mode_BINARY;
+   Semaphore_construct(&semScTaskAlert, 0, &semParams);
   
 }
 
@@ -915,22 +686,24 @@ void SimpleBLEPeripheral_createTask(void)
  */
 static void SimpleBLEPeripheral_init(void)
 {
-
+    wdtInitFxn();
+    set_snv_devicename();
     //clear
     for(int x=0;x<36;x++)
     {
       device[x].devicecount=0;
+      device[x].over_flag=0;//未廣播
       device[x].data_flag=0;
       device[x].CT_flag=0;
+      device[x].Peripheral=0;
+      device[x].uart7688=0;
       for(int k=0;k<31;k++)
       {
         device[x].data[k]=0;
       }
     }
-    PIN_setOutputValue(hSbpPins, Board_LED6, 0);
-    PIN_setOutputValue(hSbpPins, Board_LED0, 0);
+
   
-    
     //UART
     /*
     UART_Params_init(&SbpUartParams);
@@ -947,21 +720,18 @@ static void SimpleBLEPeripheral_init(void)
   ICall_registerApp(&selfEntity, &sem);
 
   // Hard code the BD Address till CC2650 board gets its own IEEE address
-  //uint8 self_address[6] = { 0x02,0x00,0x01,0x7D,0x3A,0x50};
-  //HCI_EXT_SetBDADDRCmd(self_address);
-  // Set device's Sleep Clock Accuracy
-  //HCI_EXT_SetSCACmd(80);
 
-  //HCI_EXT_SetTxPowerCmd(LL_EXT_TX_POWER_1_DBM);
+
+  // Set device's Sleep Clock Accuracy
+  //HCI_EXT_SetSCACmd(40);
+
   // Create an RTOS queue for message from profile to be sent to app.
   appMsgQueue = Util_constructQueue(&appMsg);
- 
+
   // Create one-shot clocks for internal periodic events.
-  //Util_constructClock(&NOTI, SimpleBLEPeripheral_clockHandler,0,0, false, SBP_NOTIFY);
-  Util_constructClock(&SAVEClock, SimpleBLEPeripheral_clockHandler,SBP_PERIODIC_EVT_PERIOD,100, true, SBP_PERIODIC_EVT);
-  //Util_startClock(&SAVEClock);//重新啟動時鐘
-  //Util_constructClock(&CLEARClock, SimpleBLEPeripheral_clockHandler,SBP_PERIODIC_EVT_PERIOD,0, false, CLEAR_EVT);
-  //Util_startClock(&CLEARClock);//重新啟動時鐘  
+  Util_constructClock(&SAVEClock, SimpleBLEPeripheral_clockHandler,50,0, false, SBP_PERIODIC_EVT);
+  Util_startClock(&SAVEClock);//重新啟動時鐘
+
   
 /*
 #ifndef SENSORTAG_HW
@@ -997,8 +767,8 @@ static void SimpleBLEPeripheral_init(void)
                          &initialAdvertEnable);
     //GAPRole_SetParameter(GAPROLE_ADVERT_OFF_TIME, sizeof(uint16_t),
     //                     &advertOffTime);
-    GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, sizeof(scanRspData),scanRspData);//定位data
-    GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(ios_data), ios_data);
+    GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, sizeof(ios_data),ios_data);
+    GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
 
     GAPRole_SetParameter(GAPROLE_PARAM_UPDATE_ENABLE, sizeof(uint8_t),
                          &enableUpdateRequest);
@@ -1012,9 +782,8 @@ static void SimpleBLEPeripheral_init(void)
                          &desiredConnTimeout);
   }
 
-  uint8_t set_snv_devicename(void);
   // Set the GAP Characteristics
-  //GGS_SetParameter(GGS_DEVICE_NAME_ATT, GAP_DEVICE_NAME_LEN, attDeviceName);//device ID
+  GGS_SetParameter(GGS_DEVICE_NAME_ATT, GAP_DEVICE_NAME_LEN, attDeviceName);
 
   // Set advertising interval
   {
@@ -1050,6 +819,7 @@ static void SimpleBLEPeripheral_init(void)
 
   SimpleProfile_AddService(GATT_ALL_SERVICES); // Simple GATT Profile
 
+
 #ifdef FEATURE_OAD
   VOID OAD_addService();                 // OAD Profile
   OAD_register((oadTargetCBs_t *)&simpleBLEPeripheral_oadCBs);
@@ -1060,7 +830,7 @@ static void SimpleBLEPeripheral_init(void)
   Reset_addService();
 #endif //IMAGE_INVALIDATE
   
-  
+  /*
 #ifndef FEATURE_OAD
   // Setup the SimpleProfile Characteristic Values
   {
@@ -1085,15 +855,9 @@ static void SimpleBLEPeripheral_init(void)
   // Register callback with SimpleGATTprofile
   
 #endif //!FEATURE_OAD
-
+*/
+  SimpleProfile_RegisterAppCBs(&SimpleBLEPeripheral_simpleProfileCBs);//被連線
   
-  //RTC初始化  
-  GUA_RTC_Init();  
-  
-
-
-  SimpleProfile_RegisterAppCBs(&SimpleBLEPeripheral_simpleProfileCBs);
-  //HCI_EXT_SetTxPowerCmd(HCI_EXT_TX_POWER_2_DBM);
   // Start the Device
   VOID GAPRole_StartDevice(&SimpleBLEPeripheral_gapRoleCBs);//開啟裝置
 
@@ -1103,54 +867,47 @@ static void SimpleBLEPeripheral_init(void)
   // Register with GAP for HCI/Host messages
   GAP_RegisterForMsgs(selfEntity);
     
-  osal_snv_read(0x80, sizeof(int)*20, flash);   
+  osal_snv_read(0x80, sizeof(int)*20, flash);
   
-  //經
-  MyLight_lonSum_printf_lon_H = flash[14];
-  MyLight_lonSum_printf_lon_L = flash[15];
+  osal_snv_read(0x82, sizeof(char)*50, final_7688);    
 
-  //緯
-  MyLight_latSum_printf_lat_H = flash[9];
-  MyLight_latSum_printf_lat_L = flash[10];   
-  
+
   //自身位置
-  MyLight_lonSum  = ((MyLight_lonSum_printf_lon_H & 0xF0) >>4)*1000  +   (MyLight_lonSum_printf_lon_H & 0x0F)*100 +  ((MyLight_lonSum_printf_lon_L & 0xF0) >>4)*10 + (MyLight_lonSum_printf_lon_L & 0x0F);
-  MyLight_latSum  = ((MyLight_latSum_printf_lat_H & 0xF0) >>4)*1000  +   (MyLight_latSum_printf_lat_H & 0x0F)*100 +  ((MyLight_latSum_printf_lat_L & 0xF0) >>4)*10 + (MyLight_latSum_printf_lat_L & 0x0F);
+  MyLight_lonSum = ((flash[2] & 0xF0) >>4)*1000  +   (flash[2] & 0x0F)*100 +  ((flash[3] & 0xF0) >>4)*10 + (flash[3] & 0x0F);
+  MyLight_latSum  = ((flash[0] & 0xF0) >>4)*1000  +   (flash[0] & 0x0F)*100 +  ((flash[1] & 0xF0) >>4)*10 + (flash[1] & 0x0F);    
 
   Final_lonSum  = ((flash[2] & 0xF0) >>4)*1000  +   (flash[2] & 0x0F)*100 +  ((flash[3] & 0xF0) >>4)*10 + (flash[3] & 0x0F);     
   Final_latSum  = (( flash[0] & 0xF0) >>4)*1000  +   ( flash[0] & 0x0F)*100 +  (( flash[1] & 0xF0) >>4)*10 + ( flash[1] & 0x0F);
   
+  MyLight_lonSum = Final_lonSum;
+  MyLight_latSum = Final_latSum;
   
-   ios_data[24]     =       flash[17]; //Pr0
-   ios_data[25]     =       flash[18]; //E0_1
-   ios_data[26]     =       flash[19]; //E0_2
-
-   
-   ios_data[27]     =       MyLight_lonSum_printf_lon_H; 
-   ios_data[28]     =       MyLight_lonSum_printf_lon_L;
-   ios_data[29]     =       MyLight_latSum_printf_lat_H;
-   ios_data[30]     =       MyLight_latSum_printf_lat_L;     
-
-   advertData_IOS[22]     =       MyLight_lonSum_printf_lon_H; 
-   advertData_IOS[23]     =       MyLight_lonSum_printf_lon_L;
-   advertData_IOS[24]     =       MyLight_latSum_printf_lat_H;
-   advertData_IOS[25]     =       MyLight_latSum_printf_lat_L;      
-   
-   int  UTLtxpower[1];
-   osal_snv_read(0x82, sizeof(int)*1, UTLtxpower);
-   HCI_EXT_SetTxPowerCmd(UTLtxpower[0]);
+  MyLight_latSum_printf_lon_H = flash[2];
+  MyLight_latSum_printf_lon_L = flash[3];
+  
+  MyLight_latSum_printf_lat_H = flash[0];
+  MyLight_latSum_printf_lat_L = flash[1];
 
 
-    
-
-  //PIN_setOutputValue(hSbpPins, Board_LED6, 0);
-  //PIN_setOutputValue(hSbpPins, Board_LED0, 0);
-/*
+  
+   ios_data[0]=0x1A;
+   ios_data[22]=MyLight_latSum_printf_lon_H;
+   ios_data[23]=MyLight_latSum_printf_lon_L;
+   ios_data[24]=MyLight_latSum_printf_lat_H;
+   ios_data[25]=MyLight_latSum_printf_lat_L;
+     /*
+   hand_data[4]     =       ios_data[22];
+   hand_data[5]     =       ios_data[23];
+   hand_data[9]     =       ios_data[24];
+   hand_data[10]   =       ios_data[25];
+   */
+  PIN_setOutputValue(hSbpPins, Board_LED6, 0);
+  PIN_setOutputValue(hSbpPins, Board_LED0, 1);
+  
   if(ios_data!=0x00)
   {
-  ios_data[0]=0x1A;
-  }  */
-  
+    ios_data[0]=0x1A;
+  }  
   // Register for GATT local events and ATT Responses pending for transmission
   GATT_RegisterForMsgs(selfEntity);
   
@@ -1192,8 +949,7 @@ static void PWM_taskFxn (UArg a0, UArg a1) {
   /* PWM open should will set to pin to idle level  */
   hPWM = PWM_open(CC2650_PWM0, &pwmParams);
 
-  if(hPWM == NULL) 
-  {
+  if(hPWM == NULL) {
     Log_error0("Opening PWM failed");
     while(1);
   }
@@ -1278,11 +1034,9 @@ static void SimpleBLEPeripheral_taskFxn(UArg a0, UArg a1)
   // Initialize application
   SimpleBLEPeripheral_init();
   
-  set_snv_devicename();//device name
-  GUA_Read_Mac(nGUA_Address);//mac
   
-  memcpy(scanRspData+14,nGUA_Address,6);
-  memcpy(advertData_IOS+6,nGUA_Address,6);
+  GUA_Read_Mac(nGUA_Address);
+  
   //傳MAC給Master
   MAC_Address[0]=0xAB;
   MAC_Address[1]=0xAB;
@@ -1293,11 +1047,13 @@ static void SimpleBLEPeripheral_taskFxn(UArg a0, UArg a1)
   MAC_Address[6]=nGUA_Address[4];
   MAC_Address[7]=nGUA_Address[5];
 
+  PIN_setOutputValue(hSbpPins, Board_in, 0);  
+  
   for(int a=0;a<8;a++)
     scifUartTxPutChar(MAC_Address[a]);
+  //傳MAC給Master
   
-  memcpy(scanRspData+2,DeviceName,10);
-  
+
   // Application main loop
   for (;;)
   {
@@ -1358,97 +1114,186 @@ static void SimpleBLEPeripheral_taskFxn(UArg a0, UArg a1)
         }
       }
     }
+
+
     
-    if( events & SBP_PERIODIC_EVT)
+    if (events & SBP_PERIODIC_EVT)//廣播
     {
-      events &= ~SBP_PERIODIC_EVT;
-      if(linked != 1)
-        PIN_setOutputValue(hSbpPins, Board_LED0,0);
-      if(OAD_FLAG == 0)
+      
+      if(lat_lon7688==1)
       {
-        once=1;   
+        delaysec(1);
+        PIN_setOutputValue(hSbpPins, Board_in, 1);  
+        for(int a=0;a<30;a++)
+          scifUartTxPutChar(final_7688[a]);//寫經緯
+      }
+      
+      
+      events &= ~SBP_PERIODIC_EVT;
+      Util_stopClock(&SAVEClock);//停止
+
+      if( ledvale ==1)
+      {
+        PIN_setOutputValue(hSbpPins, Board_LED6, ledvale);
+        ledvale=0;
+      }
+      else
+      {
+        PIN_setOutputValue(hSbpPins, Board_LED6, ledvale);
+        ledvale=1;
+      }   
+      
+      
+      for(int a=0;a<36;a++)
+      {
+        if(device[a].data_flag==1)
+        {
+          device[a].devicecount++;
+        }
+      }
+      
+      
+      
+        once=1;
         
         //檢查buffer內有資料否  hopping+定位廣播
         for(int o=0;o<36;o++)
         {
-          if((device[o].data_flag == 1) && (once == 1))
+          if((device[o].data_flag == 1) && (once == 1) && (device[o].CT_flag != 1 ) && (device[o].Peripheral == 1) )
           {
+            device[o].Peripheral=0;
             once=0;//只能進一次
-            PIN_setOutputValue(hSbpPins, Board_LED0,1);
-            if(scanp == 0)
+            PIN_setOutputValue(hSbpPins, Board_LED0, 1);
+            //hopping
+            GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(device[o].data), device[o].data);  
+            //手環          
+            GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, 0, hand_data);
+            //廣播hopping
+            //uint8 initialAdvertEnable=true;
+            //GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),&initialAdvertEnable);    
+            
+            
+            
+            if(device[o].uart7688!=1  &&  device[o].data[0]!=0)
             {
-              scanp=1;
-              GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(device[o].data), device[o].data);  
-              device[o].devicecount++;
-              Task_sleep(50000);
-            }
-            else
-            {
-              scanp=0;
-              GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(ios_data), ios_data);  
-              device[o].devicecount++;
-              Task_sleep(50000);     
+              uint8 txplacebuffer[63]={0};
+              
+              
+              txplacebuffer[0] = '$';
+
+              
+              for(int a=0;a<30;a++)
+              {
+                txplacebuffer[2*a+1] = (device[o].data[a+1] & 0xF0) >> 4 ;
+                txplacebuffer[2*a+2]  = (device[o].data[a+1] & 0x0F);
+              }
+              
+              txplacebuffer[1] = (device[o].data[1] & 0xF0) >> 4;
+              txplacebuffer[2] = (device[o].data[1] & 0x0F);  
+              
+              for(int q=1;q<62;q++)
+              {
+                if(txplacebuffer[q]<10)
+                {
+                  txplacebuffer[q]=txplacebuffer[q] + 0x30;
+                }
+                else if (txplacebuffer[q]==10)
+                {
+                  txplacebuffer[q]='A';          
+                }
+                else if (txplacebuffer[q]==11)
+                {
+                  txplacebuffer[q]='B';          
+                }
+                else if (txplacebuffer[q]==12)
+                {
+                  txplacebuffer[q]='C';          
+                }
+                else if (txplacebuffer[q]==13)
+                {
+                  txplacebuffer[q]='D';          
+                }
+                else if (txplacebuffer[q]==14)
+                {
+                  txplacebuffer[q]='E';          
+                }
+                else if (txplacebuffer[q]==15)
+                {
+                  txplacebuffer[q]='F';          
+                }          
+              }
+              
+              txplacebuffer[61] = '\r';
+              txplacebuffer[62] = '\n';
+              
+              for(int u=0;u<63;u++)
+                txbuf7688[u]=txplacebuffer[u];
+              
+              
+              PIN_setOutputValue(hSbpPins, Board_in, 1);  
+
+              scifUartTxPutChars(txbuf7688,63); //傳UART給7688
+              device[o].uart7688=1;
+              Task_sleep(10000);
+  
+              PIN_setOutputValue(hSbpPins, Board_in, 0);
             }
             
-            if(device[o].devicecount>3)
-            {
-              device[o].data_flag=0;//清空buffer
-              device[o].devicecount=0;
-              
-              for(int s=0;s<31;s++)
-                device[o].data[s]=0; 
-              
-              order++; 
-              
-              if(order >= 35)
-                order = 0;
-              
-              if(jzx >= 35)
-                jzx = 0;
-              
-            } 
+            
           }
-          //hopping
-          GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, sizeof(scanRspData), scanRspData);
           
-          if(device[o].CT_flag == 1 && device[o].devicecount > 5)//是控燈自己,刪除
+          //CT
+          else if( (device[o].data_flag == 1) && (once == 1) && (device[o].data[0] == 'C')  && ( device[o].CT_flag == 1 ) )
           {
-            for(int a=0;a<31;a++)
-            {
-              device[o].data[a] = 0;
-            }
-            device[o].CT_flag = 0;
-            device[o].data_flag = 0;
-            device[o].devicecount = 0;
+            //自己 廣3秒
+            device[order].devicecount++;//廣播秒數
+            once=0;//只能進一次
+            PIN_setOutputValue(hSbpPins, Board_LED6, 0);
+            //hopping
+            GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(device[o].data), device[o].data);  
+            //手環          GAPROLE_ADVERT_DATA
+            GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, 0, hand_data);
+            //廣播hopping
+            //uint8 initialAdvertEnable=true;
+            //GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),&initialAdvertEnable); 
           }
-        }
+          
+           //清空buffer 廣播旗標
+          
+          
+          if( device[o].devicecount >3*15)//3sec
+          {
+            device[o].data_flag=0;
+            device[o].Peripheral=0;
+            device[o].devicecount=0;
+            device[o].uart7688=0;
+            
+            for(int s=0;s<31;s++)
+              device[o].data[s]=0;    
+          
+          }
+            dontsave=0;
 
-        //ios廣播+定位
-        if(once==1)
-        {
-          once = 0;
-          if(scanp==1)          
+           }
+          //ios+定位廣播
+          if(once==1)
           {
-            scanp=0;
-            GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, sizeof(ios_data),ios_data);  
-            GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(scanRspData), scanRspData);
-            Task_sleep(50000);
-          }
-          else
-          {
-            scanp=1;
-            GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, sizeof(advertData_IOS),advertData_IOS);
-            GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(advertData), advertData);
-            Task_sleep(50000);
-          }
-        }
-      }
+            PIN_setOutputValue(hSbpPins, Board_LED0, 0);
+            //IOS 
+            GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(ios_data),ios_data);    
+            //手環        GAPROLE_ADVERT_DATA
+            GAPRole_SetParameter(GAPROLE_SCAN_RSP_DATA, 0, hand_data);       
+            //定位
+            //uint8 initialAdvertEnable=true;
+            //GAPRole_SetParameter(GAPROLE_ADVERT_ENABLED, sizeof(uint8_t),&initialAdvertEnable);
+          }      
+
+     Util_startClock(&SAVEClock);//重新啟動本事件
     }
 
 #ifdef FEATURE_OAD
     while (!Queue_empty(hOadQ))
     {
-      OAD_FLAG = 1;
       oadTargetWrite_t *oadWriteEvt = Queue_dequeue(hOadQ);
 
       // Identify new image.
@@ -1756,39 +1601,17 @@ static void SimpleBLEPeripheral_processStateChangeEvt(gaprole_States_t newState)
       break;
 #endif //PLUS_BROADCASTER   
 
-    case GAPROLE_CONNECTED://被連線中 未寫入
+    case GAPROLE_CONNECTED://連線進入這
       {
-        linked = 1;
-        //PWM_setDuty(hPWM, 1000);
-        PIN_setOutputValue(hSbpPins, Board_LED0, 1);
-        //Util_stopClock(&SAVEClock);//停止
-        //time_link_now        =       Clock_getTicks();//算minsec
-        
         uint8_t peerAddress[B_ADDR_LEN];
         
-        GUA_Timer.day = 0;
-        GUA_Timer.hour = 0;
-        GUA_Timer.minseconds = 0;
-        GUA_Timer.minutes = 0;
-        GUA_Timer.month = 0;    
-        GUA_Timer.seconds = 0;    
-        GUA_RTC_Set(&GUA_Timer);
+        //Util_stopClock(&CLEARClock);//停止
+        Util_stopClock(&SAVEClock);//停止
         
-        GUA_RTC_Get(&GUA_Timer);//得到時分秒
-        
-        systimelink_now[0] = GUA_Timer.hour;         
-        systimelink_now[1] = GUA_Timer.minutes;       
-        systimelink_now[2] = GUA_Timer.seconds;       
-        systimelink_now[3] = GUA_Timer.minseconds;
-   
-
-
         PIN_setOutputValue(hSbpPins, Board_LED0, 1);
         
         GAPRole_GetParameter(GAPROLE_CONN_BD_ADDR, peerAddress);
-        
-        GAPRole_GetParameter( GAPROLE_CONNHANDLE, &gapConnHandle );
-        
+
         Util_startClock(&periodicClock);
 
         LCD_WRITE_STRING("Connected", LCD_PAGE2);
@@ -1823,27 +1646,21 @@ static void SimpleBLEPeripheral_processStateChangeEvt(gaprole_States_t newState)
       break;
 
     case GAPROLE_WAITING:
-        linked = 0;
-      //PWM_setDuty(hPWM, 0);
-      PIN_setOutputValue(hSbpPins, Board_LED0, 0);
-      Util_stopClock(&periodicClock);//被連線 沒寫值就斷線
+      Util_stopClock(&periodicClock);
+      Util_startClock(&SAVEClock);//重新啟動時鐘
       SimpleBLEPeripheral_freeAttRsp(bleNotConnected);
-      /*
+
       LCD_WRITE_STRING("Disconnected", LCD_PAGE2);
 
       // Clear remaining lines
       LCD_WRITE_STRING("", LCD_PAGE3);
       LCD_WRITE_STRING("", LCD_PAGE4);
       LCD_WRITE_STRING("", LCD_PAGE5);
-      */
       break;
 
     case GAPROLE_WAITING_AFTER_TIMEOUT:
-        linked = 0;
-      //PWM_setDuty(hPWM, 0);
-      PIN_setOutputValue(hSbpPins, Board_LED0, 0);
       SimpleBLEPeripheral_freeAttRsp(bleNotConnected);
-      
+      Util_startClock(&SAVEClock);
       LCD_WRITE_STRING("Timed Out", LCD_PAGE2);
       
       // Clear remaining lines
@@ -1912,233 +1729,36 @@ static void SimpleBLEPeripheral_processCharValueChangeEvt(uint8_t paramID)
 
     case SIMPLEPROFILE_CHAR3:
       SimpleProfile_GetParameter(SIMPLEPROFILE_CHAR3, &newValue3);
-      
 
-      if(       newValue3[0]    ==      0xDD    &&      newValue3[1]    ==      0xDD   &&      newValue3[2]    ==      0xCD  )//改變功率
-      { 
-        int UTLtxpower[1];
-        /*
-      #define LL_EXT_TX_POWER_MINUS_21_DBM                   0
-      #define LL_EXT_TX_POWER_MINUS_18_DBM                   1
-      #define LL_EXT_TX_POWER_MINUS_15_DBM                   2
-      #define LL_EXT_TX_POWER_MINUS_12_DBM                   3
-      #define LL_EXT_TX_POWER_MINUS_9_DBM                    4
-      #define LL_EXT_TX_POWER_MINUS_6_DBM                    5
-      #define LL_EXT_TX_POWER_MINUS_3_DBM                    6
-      #define LL_EXT_TX_POWER_0_DBM                          7
-      #define LL_EXT_TX_POWER_1_DBM                          8
-      #define LL_EXT_TX_POWER_2_DBM                          9
-      #define LL_EXT_TX_POWER_3_DBM                          10
-      #define LL_EXT_TX_POWER_4_DBM                          11
-      #define LL_EXT_TX_POWER_5_DBM                          12
-        */
-        GAPRole_TerminateConnection();      
-        UTLtxpower[0] = newValue3[3];
-        osal_snv_write(0x82, sizeof(int)*1, UTLtxpower);
-        
-        HCI_EXT_SetTxPowerCmd(UTLtxpower[0]);
-      } 
-      
-      
-      
-      if(       newValue3[0]    ==      0x53    &&      newValue3[1]    ==      0x53    )//時間同步
-      {
-       // Util_stopClock(&SAVEClock);//停止
-        GUA_RTC_Get(&GUA_Timer);//得到時分秒
-        
-        systimelink_over[0] = GUA_Timer.hour;
-        systimelink_over[1] = GUA_Timer.minutes;      
-        systimelink_over[2] = GUA_Timer.seconds;
-        systimelink_over[3] = GUA_Timer.minseconds;
-        
-        
-        
-        
-        
-        GUA_Timer.hour                =       newValue3[2]+systimelink_over[0] - systimelink_now[0];//時
-        GUA_Timer.minutes           =       newValue3[3]+systimelink_over[1] - systimelink_now[1];//分
-        GUA_Timer.seconds           =       newValue3[4]+systimelink_over[2] - systimelink_now[2];//秒
-        //合成minsec
-
-        mins     =       ((newValue3[5]<<8) |newValue3[6]);                                                       //接收傳來的minsec_1
-        //mins     =       mins<< 8        +      newValue3[6];                        //接收傳來的minsec_2      
-        GUA_Timer.minseconds     =       mins + systimelink_over[3] - systimelink_now[3];//接收傳來的minsec + 延遲 
-       //同步完成時間
-       sysovertime[0]   =       newValue3[7];
-       sysovertime[1]   =       newValue3[8];
-       sysovertime[2]   =       newValue3[9];     
-
-        sys_F   = 1;
-        //變成同步後
-        //hand_data[1]='V';
-
-        PIN_setOutputValue(hSbpPins, Board_LED0, 0);
-
-       //時間進位
-       if(GUA_Timer.minseconds>=1000)
-       {
-          GUA_Timer.minseconds = GUA_Timer.minseconds-1000;
-          GUA_Timer.seconds = GUA_Timer.seconds+1;
-       }     
-       if(GUA_Timer.seconds>=60)
-       {
-          GUA_Timer.seconds = GUA_Timer.seconds-60;
-          GUA_Timer.minutes = GUA_Timer.minutes+1;
-       }         
-       if(GUA_Timer.minutes>=60)
-       {
-          GUA_Timer.minutes = GUA_Timer.minutes-60;
-          GUA_Timer.hour = GUA_Timer.hour+1;
-       }      
-       if(GUA_Timer.hour>=24)
-       {
-          GUA_Timer.hour = GUA_Timer.hour-24;
-       }         
- 
-       
-        GUA_RTC_Set(&GUA_Timer);//設定時間
-
-        GUA_RTC_Get(&GUA_Timer);//拿時間
-
-        uint8 systxbuf[20];
-
-        newValue3[2]    =       GUA_Timer.hour;
-        newValue3[3]    =       GUA_Timer.minutes; 
-        newValue3[4]    =       GUA_Timer.seconds; 
-        newValue3[5]    =       ((uint16)(GUA_Timer.minseconds) >>8);           //拆1
-        newValue3[6]    =       ((uint16)(GUA_Timer.minseconds) & 0x00FF); //拆2
-        
-        //傳送時間uart給Master 並開始同步
-        for(int a=0;a<20;a++)
-        {
-          systxbuf[a]   =       newValue3[a];
-          scifUartTxPutChar(systxbuf[a]);
-        }
-        
-        //////////notify
-        uint8 state1;
-        uint16 len;
-        //bStatus_t status;
-        attHandleValueNoti_t notify_back;
-
-        GAPRole_GetParameter(GAPROLE_CONNHANDLE,&handle);
-        
-        notify_back.pValue = (uint8 *)GATT_bm_alloc( gapConnHandle, ATT_HANDLE_VALUE_NOTI,
-                                        GATT_MAX_MTU, &len );//1.4 & 2.1以後規定
-        
-        
-       if ( notify_back.pValue != NULL )
-       {
-          notify_back.handle = 0x0027;//notify  //
-          
-          notify_back.len = 3;
-          notify_back.pValue[0] = newValue3[4]; //sec
-          notify_back.pValue[1] = newValue3[5]; //minsec_1
-          notify_back.pValue[2] = newValue3[6]; //minsec_2
-          state1 = GATT_Notification(gapConnHandle,&notify_back,FALSE);        
-          
-       }
-       else
-       {
-          GAPRole_TerminateConnection();
-       }    
-        //////////notify 
-        
-        
-        GAPRole_TerminateConnection();
-        
-        //scifUartTxPutChars(newValue3,20); //newValue3 要為char
-        
-        //GAPRole_SetParameter(GAPROLE_ADVERT_DATA, sizeof(hand_data), hand_data);
-        PIN_setOutputValue(hSbpPins, Board_LED6, 1);
-        //Util_startClock(&SAVEClock);//重新啟動CLEAR時鐘
-      }///////////////////////////////sys_end
-
-      
       
       if(newValue3[0]==0x30)//控燈
       {
-        if(newValue3[7]=='z')//控燈結束  Z-->5A  Z-->7A
+        if(newValue3[7]=='z')//控燈結束 改廣播值
         {
          controltime = 0;
-         PIN_setOutputValue(hSbpPins, Board_LED0, 0);
          GAPRole_TerminateConnection();        
-        // Util_startClock(&SAVEClock);//重新啟動CLEAR時鐘
-        }
+         Util_startClock(&SAVEClock);//重新啟動CLEAR時鐘
+         
+         
+        }    
         if(newValue3[1]=='Z')//收經緯
         {
-          //是自己任務否
-          if(   (newValue3[2])  ==      MyLight_lonSum_printf_lon_H        &&
-                 (newValue3[3])  ==      MyLight_lonSum_printf_lon_L        &&
-                 (newValue3[4])  ==      MyLight_latSum_printf_lat_H          &&
-                 (newValue3[5])  ==      MyLight_latSum_printf_lat_L        )
+          for(int p=0;p<36;p++)
           {
-            self_falg=1;//是自己
-          }
-          else
-          {
-            self_falg=0;//別人任務
-          }
-        }
-        if(self_falg == 0 )//別人任務
-        {
-         //save
-         device[jzx].data_flag=1;//有資料
-         //23開or關
-         device[jzx].data[23] = newValue3[6];
-         //自己經緯
-         device[jzx].data[25] = MyLight_lonSum_printf_lon_H;
-         device[jzx].data[26] = MyLight_lonSum_printf_lon_L;
-         device[jzx].data[27] = MyLight_latSum_printf_lat_H;
-         device[jzx].data[28] = MyLight_latSum_printf_lat_L;
-         //目標經緯
-         device[jzx].data[10] = newValue3[2];  
-         device[jzx].data[11] = newValue3[3];  
-         device[jzx].data[12] = newValue3[4];  
-         device[jzx].data[13] = newValue3[5];
-         
-         device[jzx].data[0] = 'C';  
-         device[jzx].data[1] = 'T'; 
-         device[jzx].data[30] = 0x07;      
-         
-         memcpy(txbuf,device[jzx].data,31);
-         scifUartTxPutChars(txbuf,31);
-
-         jzx++;  //下一個        
-         
-         if(jzx>=35)
-           jzx=0;
-   
-        }
-        else//自己亮滅燈  廣一下即可
-        {
-          //save
-          device[jzx].CT_flag = 1;
-          device[jzx].data_flag = 1;//有資料
-          //23開or關
-          device[jzx].data[23] = newValue3[6];
-          //自己經緯
-          device[jzx].data[25] = MyLight_lonSum_printf_lon_H;
-          device[jzx].data[26] = MyLight_lonSum_printf_lon_L;
-          device[jzx].data[27] = MyLight_latSum_printf_lat_H;
-          device[jzx].data[28] = MyLight_latSum_printf_lat_L;
-          //目標經緯
-          device[jzx].data[10] = newValue3[2];  
-          device[jzx].data[11] = newValue3[3];  
-          device[jzx].data[12] = newValue3[4];  
-          device[jzx].data[13] = newValue3[5];
-
-          device[jzx].data[0] = 'C';  
-          device[jzx].data[1] = 'T'; 
-          device[jzx].data[30] = 0x07;      
-       
-
-
-          jzx++;  //下一個        
-
-          if(jzx>=35)
-           jzx=0;
-
+            if( ((newValue3[2]) == (device[p].data[10]))    && 
+                 ((newValue3[3]) == (device[p].data[11]))     && 
+                 ((newValue3[4]) == (device[p].data[12]))     && 
+                 ((newValue3[5]) == (device[p].data[13]))     
+                                                                                    )
+            {
+              repeat_flag=1;//有重複
+              break;
+            }         
+          }          
+          
+          
+           
+          self_falg =1;          
           if(newValue3[6] == 0x01)//亮 
           {
             PIN_setOutputValue(hSbpPins, Board_LED6, 1); 
@@ -2148,136 +1768,171 @@ static void SimpleBLEPeripheral_processCharValueChangeEvt(uint8_t paramID)
             PIN_setOutputValue(hSbpPins, Board_LED6, 0);           
           }
         }
-       }
+         
+        if(self_falg != 1 )
+        {
 
-      else if( newValue3[0] == 0x26  &&
-                   newValue3[2] == 0x12 &&
-                   newValue3[3] == 0x34 &&
-                   newValue3[4] == 0x56 &&
-                   newValue3[5] == 0x78   )//設定經緯 or 終點
+         //save
+         device[jzx].over_flag=0;//未廣播
+         device[jzx].data_flag=1;//有資料
+         //23開or關
+         device[jzx].data[23] = newValue3[6];
+         //目標經緯
+         device[jzx].data[25] = flash[4];
+         device[jzx].data[26] = flash[5];
+         device[jzx].data[27] = flash[9];
+         device[jzx].data[28] = flash[10];
+         //目標經緯
+         device[jzx].data[10] = newValue3[2];  
+         device[jzx].data[11] = newValue3[3];  
+         device[jzx].data[12] = newValue3[4];  
+         device[jzx].data[13] = newValue3[5];
+         
+         device[jzx].data[0] = 'C';  
+         device[jzx].data[1] = 'T'; 
+         device[jzx].data[30] = 0x07;      
+
+         
+         
+         for(int c=0;c<31;c++)
+           txbuf[c] = device[jzx].data[c];
+         
+         txbuf[1]='D';
+         
+        for(int a=0;a<31;a++)
+          scifUartTxPutChar(txbuf[a]);
+            
+         //UART_write(SbpUartHandle, txbuf, 31);
+         
+         jzx++;  //下一個        
+        }   
+       }   
+     
+      
+      
+      
+      else if( newValue3[0] == '&'    &&
+                  newValue3[2] == 0x12 &&
+                  newValue3[3] == 0x34 &&
+                  newValue3[4] == 0x56 &&
+                  newValue3[5] == 0x78  &&
+                  newValue3[1] == 0x01 )//設定經緯
       {
-        //PWM_setDuty(hPWM, 0);
-        if( newValue3[1] == 0x00 )
-        {
-  
-          flash[9]   = newValue3[9] ;  //緯度4 主
-          flash[10] = newValue3[10] ;//緯度5 主
           
-          flash[14] = newValue3[14] ;//經度4主
-          flash[15] = newValue3[15] ;//經度5主
-
-          
-          GAPRole_TerminateConnection();
-          
-          //緯
-          MyLight_latSum_printf_lat_H = flash[9];
-          MyLight_latSum_printf_lat_L =  flash[10]; 
-          
-          //經
-          MyLight_lonSum_printf_lon_H = flash[14];
-          MyLight_lonSum_printf_lon_L = flash[15];
-
-         advertData_IOS[22]     =       MyLight_lonSum_printf_lon_H; 
-         advertData_IOS[23]     =       MyLight_lonSum_printf_lon_L;
-         advertData_IOS[24]     =       MyLight_latSum_printf_lat_H;
-         advertData_IOS[25]     =       MyLight_latSum_printf_lat_L;       
-         
-         ios_data[27]     =       MyLight_lonSum_printf_lon_H; 
-         ios_data[28]     =       MyLight_lonSum_printf_lon_L;
-         ios_data[29]     =       MyLight_latSum_printf_lat_H;
-         ios_data[30]     =       MyLight_latSum_printf_lat_L;     
-                  
-
-          //自身位置
-          MyLight_lonSum  = ((MyLight_lonSum_printf_lon_H & 0xF0) >>4)*1000  +   (MyLight_lonSum_printf_lon_H & 0x0F)*100 +  ((MyLight_lonSum_printf_lon_L & 0xF0) >>4)*10 + (MyLight_lonSum_printf_lon_L & 0x0F);
-          MyLight_latSum  = ((MyLight_latSum_printf_lat_H & 0xF0) >>4)*1000  +   (MyLight_latSum_printf_lat_H & 0x0F)*100 +  ((MyLight_latSum_printf_lat_L & 0xF0) >>4)*10 + (MyLight_latSum_printf_lat_L & 0x0F);
-          end =1;
-        }
-        else if( newValue3[1] == 0x01 ) //紀錄終點
-        {
-          GAPRole_TerminateConnection();
-          
-          flash[0] = newValue3[9];   
-          flash[1] = newValue3[10];
-          flash[2] = newValue3[14];
-          flash[3] = newValue3[15];
-
-          Final_lonSum  = ((flash[2] & 0xF0) >>4)*1000  +   (flash[2] & 0x0F)*100 +  ((flash[3] & 0xF0) >>4)*10 + (flash[3] & 0x0F);     
-          Final_latSum  = (( flash[0] & 0xF0) >>4)*1000  +   ( flash[0] & 0x0F)*100 +  (( flash[1] & 0xF0) >>4)*10 + ( flash[1] & 0x0F);
-          
-          starting_point = 1 ;
-        }
-        else if(newValue3[1] == 0xAA)//紀錄 Pr0 E
-        {
-          GAPRole_TerminateConnection();
+        GAPRole_TerminateConnection();
+        char copy[30];
+        for(int i=0;i<10;i++)
+          get7688buf[i] = newValue3[6+i]; //緯lat 經lon
         
-          Pr0 = newValue3[6];
-          
-          E0_1 = newValue3[7];
-          E0_2 = newValue3[8];    
-          
-          flash[17] = newValue3[6];//Pr0
-          flash[18] = newValue3[7];//E0_1
-          flash[19] = newValue3[8];//E0_2
-          
-          osal_snv_write(0x80, sizeof(int)*20, flash);
-          
-          ios_data[24] = Pr0;
-          ios_data[25] = E0_1; //個位數
-          ios_data[26] = E0_2; //小數點
-
-        }
-        else if(newValue3[1] == 0xBB)//紀錄裝置名稱
+        
+        //取經
+        for(int a=0;a<5;a++)
         {
-          GAPRole_TerminateConnection();
-          char attDeviceName_change[10] = "W_Node";//預設的device name
-          char getchar[4] = "";   
-          
-          getchar[0] = newValue3[6];
-          getchar[1] = newValue3[7];
-          getchar[2] = newValue3[8];
-
-         strcat(attDeviceName_change,getchar);//字串相加
-         
-         for(int i=0;i<10;i++)
-          DeviceName[i] = attDeviceName_change[i];
-         
-         osal_snv_write(0x81, sizeof(int)*10, DeviceName);
-         
-         memcpy(scanRspData+2,DeviceName,10);
-           
-         GGS_SetParameter(GGS_DEVICE_NAME_ATT, GAP_DEVICE_NAME_LEN, DeviceName);//換名字
+          tx7688buffer[2*a+1] = (get7688buf[a] & 0xF0) >> 4 ;
+          tx7688buffer[2*a+2]  = (get7688buf[a] & 0x0F);
         }
 
-        if( end  == 1 && starting_point == 1 )
+        memcpy(copy,tx7688buffer,30);
+        
+        tx7688buffer[5] = '.';
+        
+        for(int a=0;a<=5;a++)
+          tx7688buffer[a+6] = copy[a+5];
+        
+        tx7688buffer[12]='\r';
+        tx7688buffer[13]='\n';
+        tx7688buffer[14]='l';      
+        tx7688buffer[15]='a';
+        tx7688buffer[16]='t';     
+        //取緯
+        for(int a=8;a<13;a++)
         {
-          osal_snv_write(0x80, sizeof(int)*20, flash);
-          osal_snv_read(0x80, sizeof(int)*20, flash);
-          end  = 0 ;
-          starting_point = 0;
-
-          for(int k=0;k<20;k++)
-          {
-            addrbuf[k]=flash[k];
-          }
-          for(int p=20;p<31;p++)
-          {
-            addrbuf[p]=0x22;
-          }        
-          for(int a=0;a<31;a++)
-            scifUartTxPutChar(addrbuf[a]);//寫經緯        
+          tx7688buffer[2*a+1] = (get7688buf[a-3] & 0xF0) >> 4 ;
+          tx7688buffer[2*a+2]  = (get7688buf[a-3] & 0x0F);
+        }       
+        memcpy(copy,tx7688buffer,30);
+        
+        tx7688buffer[21] = '.';
+        
+        for(int a=0;a<=5;a++)
+          tx7688buffer[a+22] = copy[a+21];      
+        
+        tx7688buffer[28]='\r';
+        tx7688buffer[29]='\n';      
+        
+        tx7688buffer[0] = 'l';
+        tx7688buffer[1] = 'o';     
+        tx7688buffer[2] = 'n'; 
+        
+        final_7688[0]='s';
+        final_7688[1]='e';      
+        final_7688[2]='t';
+        
+        memcpy(final_7688+3,tx7688buffer,30);
+        
+        for(int a=0;a<33;a++)
+        {
+          if(final_7688[a]<10)
+            final_7688[a] = final_7688[a] + 0x30;
         }
+        memcpy(final_7688+20,final_7688+21,13);
+        memcpy(final_7688+15,final_7688+17,30);
+        
+        for(int i=0;i<30;i++)
+           temp[i] = final_7688[i];
+        for(int i=0;i<10;i++)
+          final_7688[i+6] = temp[i+18];
+        for(int i=0;i<12;i++)
+          final_7688[16+i] = temp[3+i];
+        
+        
+        final_7688[17] = 'a';
+        final_7688[18] = 't';     
+        
+        
+        
+        
+        lat_lon7688=1;
+        osal_snv_write(0x82, sizeof(int)*50, final_7688);    
+        osal_snv_read(0x82, sizeof(int)*50, final_7688);    
+        
+        flash[0] = newValue3[9];   
+        flash[1] = newValue3[10];
+        flash[2] = newValue3[14];
+        flash[3] = newValue3[15];
 
-      PIN_setOutputValue(hSbpPins, Board_LED0, 0);
-      //Util_startClock(&NOTI);//呼叫回傳MAC部分
+        Final_lonSum  = ((flash[2] & 0xF0) >>4)*1000  +   (flash[2] & 0x0F)*100 +  ((flash[3] & 0xF0) >>4)*10 + (flash[3] & 0x0F);     
+        Final_latSum  = (( flash[0] & 0xF0) >>4)*1000  +   ( flash[0] & 0x0F)*100 +  (( flash[1] & 0xF0) >>4)*10 + ( flash[1] & 0x0F);
+         
+          
+      osal_snv_write(0x80, sizeof(int)*20, flash);
+      osal_snv_read(0x80, sizeof(int)*20, flash);
+      
 
-    }
-    else
-    {
-      PIN_setOutputValue(hSbpPins, Board_LED6, 0);
-      GAPRole_TerminateConnection();
-    //  Util_startClock(&SAVEClock);//重新啟動CLEAR時鐘
-    }
+      PIN_setOutputValue(hSbpPins, Board_in, 0);
+      
+      for(int k=0;k<20;k++)
+      {
+        addrbuf[k]=flash[k];
+      }
+      for(int p=20;p<31;p++)
+      {
+        addrbuf[p]=0x22;
+      }        
+        
+      for(int a=0;a<31;a++)
+        scifUartTxPutChar(addrbuf[a]);//寫經緯
+
+       PIN_setOutputValue(hSbpPins, Board_LED0, 0);
+  
+
+      
+      Util_startClock(&SAVEClock);//重新啟動CLEAR時鐘
+      }
+      else
+      {
+        GAPRole_TerminateConnection();
+      }
       //LCD_WRITE_STRING_VALUE("Char 3:", (uint16_t)newValue, 10, LCD_PAGE4);
       break;
 
@@ -2301,18 +1956,10 @@ static void SimpleBLEPeripheral_processCharValueChangeEvt(uint8_t paramID)
  *
  * @return  None.
  */
-
+/*
 static void SimpleBLEPeripheral_performPeriodicTask(void)
 {
-  
-  uint8 MacAddress_notify;
-  
-  if( SimpleProfile_GetParameter(SIMPLEPROFILE_CHAR4, &MacAddress_notify) == SUCCESS )
-  {
-    SimpleProfile_SetParameter(SIMPLEPROFILE_CHAR4, sizeof(uint8),
-                          &MacAddress_notify);
-  }
-/*
+
   uint8_t valueToCopy;
 
   // Call to retrieve the value of the third characteristic in the profile
@@ -2322,14 +1969,12 @@ static void SimpleBLEPeripheral_performPeriodicTask(void)
     // Note that if notifications of the fourth characteristic have been
     // enabled by a GATT client device, then a notification will be sent
     // every time this function is called.
-    
-    
     SimpleProfile_SetParameter(SIMPLEPROFILE_CHAR4, sizeof(uint8_t),
                                &valueToCopy);
   }
-*/
-}
 
+}
+*/
 
 #if defined(FEATURE_OAD)
 /*********************************************************************
@@ -2348,7 +1993,6 @@ static void SimpleBLEPeripheral_performPeriodicTask(void)
 void SimpleBLEPeripheral_processOadWriteCB(uint8_t event, uint16_t connHandle,
                                            uint8_t *pData)
 {
-  OAD_FLAG = 1;
   oadTargetWrite_t *oadWriteEvt = ICall_malloc( sizeof(oadTargetWrite_t) + \
                                              sizeof(uint8_t) * OAD_PACKET_SIZE);
   
@@ -2432,7 +2076,7 @@ static void GUA_Read_Mac(uint8 *pGUA_Address)
   pGUA_Address[2] = nGUA_Mac0 >> 24;  
   pGUA_Address[1] = nGUA_Mac1;  
   pGUA_Address[0] = nGUA_Mac1 >> 8;  
-}
+}    
     
 
 
@@ -2458,44 +2102,50 @@ char *GUA_Addr2Str(uint8 *pGUA_Addr)
   }    
     
   return bGUA_Str;    
-}
+}   
 
 ///dealy  sec
 static void delaysec(int sec_use)
 {
   uint32_t timeNow = 1426692075;
   Seconds_set(timeNow);
-  
 
-  while( (sec = Seconds_get()) != timeNow + sec_use) {} // <- This actually waits for 5 seconds!
+  while( (sec = Seconds_get()) != timeNow + sec_use) {} // <- This actually waits for sec_use seconds!
 
   t   = time(NULL);
-  
-}
-static void systimeAns(int getTicks)
-{
-  int Allsec       =       getTicks/100000;   //所有秒數
-  int minsec      =       getTicks%1000;    //minsec
-  
-  
-  systime[0]    =       Allsec/3600;    //時
-  systime[1]    =       Allsec/60;       //分
-  systime[2]    =       Allsec%60;     //秒
-  systime[3]    =       minsec;          //minsec  
 }
 
-bool check_buffer( char inputbuffer[])
-{
-  bool answer = 1;
+//watch dog
+void wdtCallback(UArg handle)   
+{  
+    Watchdog_clear((Watchdog_Handle)handle);  
+}  
   
-  for(int a=0; a<36; a++)
-  {
-    if( memcmp( device[a].data, inputbuffer,31 ) == 0) // 假如有一模一樣的 輸出0
-    {
-      answer = 0;
-      return answer; //有完全一樣的
-    }
-  }
-  return answer;//都不一樣 輸出1
+void wdtInitFxn()   
+{
+    Watchdog_Params wp;  
+    Watchdog_Handle watchdog;  
+    Watchdog_Params_init(&wp);  
+    wp.callbackFxn    = wdtCallback;  
+    wp.debugStallMode = Watchdog_DEBUG_STALL_ON;  
+    wp.resetMode      = Watchdog_RESET_ON;  
+  
+    watchdog = Watchdog_open(Board_WATCHDOG, &wp);  
+    Watchdog_setReload(watchdog, 2*1500000); // 1sec (WDT runs always at 48MHz/32)  
+} 
+//devicename
+uint8_t set_snv_devicename(void) //device name length is define as 21
+{
+     uint8_t attDeviceName[GAP_DEVICE_NAME_LEN] = "W_Router";//預設的device name
+       if(osal_snv_read(0x85,sizeof(uint8_t)*GAP_DEVICE_NAME_LEN, attDeviceName) == ICALL_INVALID_ENTITY_ID)//it means the there isn't any device name on snv
+       {
+           //set thedevice name as default setting.
+           GGS_SetParameter(GGS_DEVICE_NAME_ATT, GAP_DEVICE_NAME_LEN, attDeviceName);
+           return (FALSE);
+       }
+       else
+       {
+           GGS_SetParameter(GGS_DEVICE_NAME_ATT, GAP_DEVICE_NAME_LEN, attDeviceName);
+           return (TRUE);
+       }
 }
-
